@@ -1,7 +1,12 @@
+#include <cstddef>
 #include <vector>
 
 #include "caffe/util/im2col.hpp"
 #include "caffe/util/math_functions.hpp"
+
+#if defined(__riscv_v)
+#include <riscv_vector.h>
+#endif
 
 namespace caffe {
 
@@ -14,6 +19,106 @@ namespace caffe {
 inline bool is_a_ge_zero_and_a_lt_b(int a, int b) {
   return static_cast<unsigned>(a) < static_cast<unsigned>(b);
 }
+
+// Generic scalar fallback for a single output row of the im2col gather:
+//   data_col[oc] = in_bounds(base_col + oc * stride_w) ? row[..] : 0
+// Used for every Dtype that has no explicit vectorized overload below.
+template <typename Dtype>
+inline void im2col_cpu_row(const Dtype* row, const int width,
+    const int base_col, const int stride_w, const int output_w,
+    Dtype* data_col) {
+  int input_col = base_col;
+  for (int output_col = output_w; output_col; output_col--) {
+    if (is_a_ge_zero_and_a_lt_b(input_col, width)) {
+      *(data_col++) = row[input_col];
+    } else {
+      *(data_col++) = 0;
+    }
+    input_col += stride_w;
+  }
+}
+
+#if defined(__riscv_v)
+// Vectorized specialization of im2col_cpu_row for float on RVV 1.0.
+//
+// This is a pure data-movement (bit-preserving) gather, so it can be
+// expressed as vector loads/stores without any FP reduction reordering:
+//   * the in-bounds output columns form one contiguous interval
+//     [lclip, rclip) because input_col = base_col + oc * stride_w is
+//     monotonically increasing in oc;
+//   * head/tail padding is written as exact +0.0f via vse32 of a zero
+//     vector (matches the scalar `*(data_col++) = 0;` bit pattern);
+//   * the interior is gathered with vle32.v (stride_w == 1, unit stride)
+//     or vlse32.v (stride_w > 1, byte stride = stride_w * 4) and stored
+//     contiguously, removing the per-element address reconstruction,
+//     single-element flw/fsw and per-element in-bounds branch.
+//
+// LMUL is m4: the live vector set of this kernel is a single register
+// group, so m4 is spill-free and amortizes vsetvl/loop control over
+// LMUL * VLEN / 32 float lanes per iteration (32 lanes at VLEN=256).
+inline void im2col_store_zero_row(float* dst, const int n) {
+  for (int i = 0; i < n;) {
+    const size_t vl = __riscv_vsetvl_e32m4(static_cast<size_t>(n - i));
+    __riscv_vse32_v_f32m4(dst + i, __riscv_vfmv_v_f_f32m4(0.0f, vl), vl);
+    i += static_cast<int>(vl);
+  }
+}
+
+inline void im2col_cpu_row(const float* row, const int width,
+    const int base_col, const int stride_w, const int output_w,
+    float* data_col) {
+  // First output column with base_col + oc * stride_w >= 0.
+  int lclip = 0;
+  if (base_col < 0) {
+    lclip = (-base_col + stride_w - 1) / stride_w;
+    if (lclip > output_w) {
+      lclip = output_w;
+    }
+  }
+  // First output column with base_col + oc * stride_w >= width.
+  int rclip = output_w;
+  const int last_in = width - 1 - base_col;
+  if (last_in < 0) {
+    rclip = 0;
+  } else {
+    const int r = last_in / stride_w + 1;
+    if (r < rclip) {
+      rclip = r;
+    }
+  }
+  if (lclip > rclip) {
+    lclip = rclip;
+  }
+
+  im2col_store_zero_row(data_col, lclip);
+
+  const int n = rclip - lclip;
+  if (n > 0) {
+    const float* src = row + base_col + lclip * stride_w;
+    float* dst = data_col + lclip;
+    if (stride_w == 1) {
+      for (int i = 0; i < n;) {
+        const size_t vl = __riscv_vsetvl_e32m4(static_cast<size_t>(n - i));
+        const vfloat32m4_t v = __riscv_vle32_v_f32m4(src + i, vl);
+        __riscv_vse32_v_f32m4(dst + i, v, vl);
+        i += static_cast<int>(vl);
+      }
+    } else {
+      const ptrdiff_t byte_stride =
+          static_cast<ptrdiff_t>(stride_w) * static_cast<ptrdiff_t>(sizeof(float));
+      for (int i = 0; i < n;) {
+        const size_t vl = __riscv_vsetvl_e32m4(static_cast<size_t>(n - i));
+        const vfloat32m4_t v = __riscv_vlse32_v_f32m4(
+            src + static_cast<ptrdiff_t>(i) * stride_w, byte_stride, vl);
+        __riscv_vse32_v_f32m4(dst + i, v, vl);
+        i += static_cast<int>(vl);
+      }
+    }
+  }
+
+  im2col_store_zero_row(data_col + rclip, output_w - rclip);
+}
+#endif  // defined(__riscv_v)
 
 template <typename Dtype>
 void im2col_cpu(const Dtype* data_im, const int channels,
@@ -37,15 +142,10 @@ void im2col_cpu(const Dtype* data_im, const int channels,
               *(data_col++) = 0;
             }
           } else {
-            int input_col = -pad_w + kernel_col * dilation_w;
-            for (int output_col = output_w; output_col; output_col--) {
-              if (is_a_ge_zero_and_a_lt_b(input_col, width)) {
-                *(data_col++) = data_im[input_row * width + input_col];
-              } else {
-                *(data_col++) = 0;
-              }
-              input_col += stride_w;
-            }
+            const int base_col = -pad_w + kernel_col * dilation_w;
+            im2col_cpu_row(data_im + input_row * width, width, base_col,
+                stride_w, output_w, data_col);
+            data_col += output_w;
           }
           input_row += stride_h;
         }
